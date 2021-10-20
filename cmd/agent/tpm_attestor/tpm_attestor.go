@@ -18,14 +18,15 @@ package main
 
 import (
 	"github.com/bloomberg/spire-tpm-plugin/pkg/agent"
-	"github.com/bloomberg/spire-tpm-plugin/pkg/common"
-	"github.com/spiffe/spire/pkg/common/catalog"
-	"github.com/spiffe/spire/proto/spire/agent/nodeattestor"
+	"github.com/spiffe/spire-plugin-sdk/pluginmain"
+	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/nodeattestor/v1"
+	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 )
 
 func main() {
-	p := agent.New()
-	catalog.PluginMain(
-		catalog.MakePlugin(common.PluginName, nodeattestor.PluginServer(p)),
+	plugin := new(agent.TPMAttestorPlugin)
+	pluginmain.Serve(
+		nodeattestorv1.NodeAttestorPluginServer(plugin),
+		configv1.ConfigServiceServer(plugin),
 	)
 }

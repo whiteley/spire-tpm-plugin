@@ -20,106 +20,133 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/go-attestation/attest"
-
-	"github.com/hashicorp/hcl"
-	"github.com/spiffe/spire/proto/spire/agent/nodeattestor"
-	spc "github.com/spiffe/spire/proto/spire/common"
-	spi "github.com/spiffe/spire/proto/spire/common/plugin"
+	"sync"
 
 	"github.com/bloomberg/spire-tpm-plugin/pkg/common"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/hcl"
+	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
+	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/nodeattestor/v1"
+	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+var (
+	// This compile time assertion ensures the plugin conforms properly to the
+	// pluginsdk.NeedsLogger interface.
+	_ pluginsdk.NeedsLogger = (*TPMAttestorPlugin)(nil)
 )
 
 // TPMAttestorPlugin implements the nodeattestor Plugin interface
 type TPMAttestorPlugin struct {
-	config *TPMAttestorPluginConfig
-	tpm    *attest.TPM
+	nodeattestorv1.UnimplementedNodeAttestorServer
+	configv1.UnimplementedConfigServer
+
+	configMtx sync.RWMutex
+	config    *TPMAttestorPluginConfig
+
+	logger hclog.Logger
+
+	tpm *attest.TPM
 }
 
 type TPMAttestorPluginConfig struct {
-	trustDomain string
+	TrustDomain string
 }
 
-func (p *TPMAttestorPlugin) Configure(ctx context.Context, req *spi.ConfigureRequest) (*spi.ConfigureResponse, error) {
-	config := &TPMAttestorPluginConfig{}
-	if err := hcl.Decode(config, req.Configuration); err != nil {
-		return nil, fmt.Errorf("failed to decode configuration file: %v", err)
+func (p *TPMAttestorPlugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
+	config := new(TPMAttestorPluginConfig)
+	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
 	}
 
-	if req.GlobalConfig == nil {
-		return nil, errors.New("global configuration is required")
+	coreConfig := req.GetCoreConfiguration()
+	if coreConfig == nil {
+		return nil, status.Error(codes.Unknown, "core configuration is required")
 	}
-	if req.GlobalConfig.TrustDomain == "" {
-		return nil, errors.New("trust_domain is required")
+	if coreConfig.TrustDomain == "" {
+		return nil, status.Error(codes.InvalidArgument, "trust_domain is required")
 	}
 
-	config.trustDomain = req.GlobalConfig.TrustDomain
+	p.setConfig(config)
+
+	return &configv1.ConfigureResponse{}, nil
+}
+
+// setConfig replaces the configuration atomically under a write lock.
+func (p *TPMAttestorPlugin) setConfig(config *TPMAttestorPluginConfig) {
+	p.configMtx.Lock()
 	p.config = config
-
-	return &spi.ConfigureResponse{}, nil
+	p.configMtx.Unlock()
 }
 
-func New() *TPMAttestorPlugin {
-	return &TPMAttestorPlugin{}
-}
-
-func (p *TPMAttestorPlugin) FetchAttestationData(stream nodeattestor.NodeAttestor_FetchAttestationDataServer) error {
+// getConfig gets the configuration under a read lock.
+func (p *TPMAttestorPlugin) getConfig() (*TPMAttestorPluginConfig, error) {
+	p.configMtx.RLock()
+	defer p.configMtx.RUnlock()
 	if p.config == nil {
-		return errors.New("tpm: plugin not configured")
+		return nil, status.Error(codes.FailedPrecondition, "not configured")
 	}
+	return p.config, nil
+}
 
+// SetLogger is called by the framework when the plugin is loaded and provides
+// the plugin with a logger wired up to SPIRE's logging facilities.
+func (p *TPMAttestorPlugin) SetLogger(logger hclog.Logger) {
+	p.logger = logger
+}
+
+func (p *TPMAttestorPlugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestationServer) error {
 	attestationData, aik, err := p.generateAttestationData()
 	if err != nil {
-		return fmt.Errorf("tpm: failed to generate attestation data: %v", err)
+		return status.Errorf(codes.Unknown, "failed to generate attestation data: %v", err)
 	}
 
 	attestationDataBytes, err := json.Marshal(attestationData)
 	if err != nil {
-		return fmt.Errorf("tpm: failed to marshal attestation data to json: %v", err)
+		return status.Errorf(codes.Unknown, "failed to marshal attestation data to json: %v", err)
 	}
 
-	if err := stream.Send(&nodeattestor.FetchAttestationDataResponse{
-		AttestationData: &spc.AttestationData{
-			Type: common.PluginName,
-			Data: attestationDataBytes,
+	if err := stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
+		Data: &nodeattestorv1.PayloadOrChallengeResponse_Payload{
+			Payload: attestationDataBytes,
 		},
 	}); err != nil {
-		return fmt.Errorf("tpm: failed to send attestation data: %v", err)
+		return status.Errorf(codes.Unknown, "failed to send attestation data: %v", err)
 	}
 
 	resp, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("tpm: failed to receive challenge: %v", err)
+		return status.Errorf(codes.Unknown, "failed to receive challenge: %v", err)
 	}
 
 	challenge := new(common.Challenge)
-	if err := json.Unmarshal(resp.Challenge, challenge); err != nil {
-		return fmt.Errorf("tpm: failed to unmarshal challenge: %v", err)
+	if err := json.Unmarshal(resp.GetChallenge(), challenge); err != nil {
+		return status.Errorf(codes.Unknown, "failed to unmarshal challenge: %v", err)
 	}
 
 	response, err := p.calculateResponse(challenge.EC, aik)
 	if err != nil {
-		return fmt.Errorf("tpm: failed to calculate response: %v", err)
+		return status.Errorf(codes.Unknown, "failed to calculate response: %v", err)
 	}
 
 	responseBytes, err := json.Marshal(response)
 	if err != nil {
-		return fmt.Errorf("tpm: unable to marshal challenge response: %v", err)
+		return status.Errorf(codes.Unknown, "unable to marshal challenge response: %v", err)
 	}
 
-	if err := stream.Send(&nodeattestor.FetchAttestationDataResponse{
-		Response: responseBytes,
+	if err := stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
+		Data: &nodeattestorv1.PayloadOrChallengeResponse_ChallengeResponse{
+			ChallengeResponse: responseBytes,
+		},
 	}); err != nil {
-		return fmt.Errorf("tpm: unable to send challenge response: %v", err)
+		return status.Errorf(codes.Unknown, "unable to send challenge response: %v", err)
 	}
 
 	return nil
-}
-
-func (p *TPMAttestorPlugin) GetPluginInfo(context.Context, *spi.GetPluginInfoRequest) (*spi.GetPluginInfoResponse, error) {
-	return &spi.GetPluginInfoResponse{}, nil
 }
 
 func (p *TPMAttestorPlugin) calculateResponse(ec *attest.EncryptedCredential, aikBytes []byte) (*common.ChallengeResponse, error) {
@@ -130,7 +157,7 @@ func (p *TPMAttestorPlugin) calculateResponse(ec *attest.EncryptedCredential, ai
 			TPMVersion: attest.TPMVersion20,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to tpm: %v", err)
+			return nil, status.Errorf(codes.Unknown, "failed to connect to tpm: %v", err)
 		}
 		defer tpm.Close()
 	}
@@ -143,7 +170,7 @@ func (p *TPMAttestorPlugin) calculateResponse(ec *attest.EncryptedCredential, ai
 
 	secret, err := aik.ActivateCredential(tpm, *ec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to activate credential: %v", err)
+		return nil, status.Errorf(codes.Unknown, "failed to activate credential: %v", err)
 	}
 	return &common.ChallengeResponse{
 		Secret: secret,
@@ -158,7 +185,7 @@ func (p *TPMAttestorPlugin) generateAttestationData() (*common.AttestationData, 
 			TPMVersion: attest.TPMVersion20,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to connect to tpm: %v", err)
+			return nil, nil, status.Errorf(codes.Unknown, "failed to connect to tpm: %v", err)
 		}
 		defer tpm.Close()
 	}
