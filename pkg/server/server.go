@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"github.com/google/go-attestation/attest"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -56,6 +57,7 @@ type TPMAttestorPlugin struct {
 type TPMAttestorPluginConfig struct {
 	TrustDomain string
 	CaPath      string `hcl:"ca_path"`
+	HashPath    string `hcl:"hash_path"`
 }
 
 func (p *TPMAttestorPlugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
@@ -70,9 +72,33 @@ func (p *TPMAttestorPlugin) Configure(ctx context.Context, req *configv1.Configu
 	}
 	if coreConfig.TrustDomain == "" {
 		return nil, status.Error(codes.InvalidArgument, "trust_domain is required")
+	} else {
+		config.TrustDomain = coreConfig.TrustDomain
 	}
-	if config.CaPath == "" {
-		config.CaPath = "/opt/spire/.data/certs"
+
+	if config.CaPath != "" {
+		if _, err := os.Stat(config.CaPath); os.IsNotExist(err) {
+			return nil, status.Errorf(codes.Unknown, "ca_path '%s' does not exist", config.CaPath)
+		}
+	} else {
+		var tryCaPath = "/opt/spire/.data/certs"
+		if _, err := os.Stat(tryCaPath); !os.IsNotExist(err) {
+			config.CaPath = tryCaPath
+		}
+	}
+	if config.HashPath != "" {
+		if _, err := os.Stat(config.HashPath); os.IsNotExist(err) {
+			return nil, status.Errorf(codes.Unknown, "hash_path '%s' does not exist", config.HashPath)
+		}
+	} else {
+		var tryHashPath = "/opt/spire/.data/hashes"
+		if _, err := os.Stat(tryHashPath); !os.IsNotExist(err) {
+			config.HashPath = tryHashPath
+		}
+	}
+
+	if config.CaPath == "" && config.HashPath == "" {
+		return nil, status.Error(codes.Unknown, "either ca_path, hash_path, or both are required")
 	}
 
 	p.setConfig(config)
@@ -106,6 +132,11 @@ func (p *TPMAttestorPlugin) SetLogger(logger hclog.Logger) {
 func (p *TPMAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	p.logger.Info("Received attestation request")
 
+	config, err := p.getConfig()
+	if err != nil {
+		return err
+	}
+
 	req, err := stream.Recv()
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "failed to receive stream: %v", err)
@@ -116,46 +147,70 @@ func (p *TPMAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 		return status.Errorf(codes.Unknown, "failed to unmarshal attestation data: %v", err)
 	}
 
-	leaf, _ := gx509.ParseCertificate(attestationData.EK)
-
-	files, err := ioutil.ReadDir(p.config.CaPath)
+	ek, err := common.DecodeEK(attestationData.EK)
 	if err != nil {
-		return status.Errorf(codes.NotFound, "could not open ca directory: %v", err)
+		return err
 	}
 
-	roots := gx509.NewCertPool()
-	for _, file := range files {
-		filename := filepath.Join(p.config.CaPath, file.Name())
-		certData, err := ioutil.ReadFile(filename)
+	hashEncoded, err := common.GetPubHash(ek)
+	if err != nil {
+		return status.Errorf(codes.Unknown, "could not get public key hash: %v", err)
+	}
+
+	validEK := false
+
+	if config.HashPath != "" {
+		filename := filepath.Join(config.HashPath, hashEncoded)
+		if _, err := os.Stat(filename); !os.IsNotExist(err) {
+			validEK = true
+		}
+	}
+
+	if !validEK && config.CaPath != "" && ek.Certificate != nil {
+		files, err := ioutil.ReadDir(config.CaPath)
 		if err != nil {
-			return status.Errorf(codes.Unknown, "could not read cert data for '%s': %v", filename, err)
+			return status.Errorf(codes.Unknown, "could not open ca directory: %v", err)
 		}
 
-		ok := roots.AppendCertsFromPEM(certData)
-		if ok {
-			continue
+		roots := gx509.NewCertPool()
+		for _, file := range files {
+			filename := filepath.Join(config.CaPath, file.Name())
+			certData, err := ioutil.ReadFile(filename)
+			if err != nil {
+				return status.Errorf(codes.Unknown, "could not read cert data for '%s': %v", filename, err)
+			}
+
+			ok := roots.AppendCertsFromPEM(certData)
+			if ok {
+				continue
+			}
+
+			root, err := gx509.ParseCertificate(certData)
+			if err == nil {
+				roots.AddCert(root)
+				continue
+			}
+
+			return status.Errorf(codes.Unknown, "could not parse cert data for '%s': %v", filename, err)
 		}
 
-		root, err := gx509.ParseCertificate(certData)
-		if err == nil {
-			roots.AddCert(root)
-			continue
+		opts := gx509.VerifyOptions{
+			Roots: roots,
 		}
-
-		return status.Errorf(codes.Unknown, "could not parse cert data for '%s': %v", filename, err)
+		_, err = ek.Certificate.Verify(opts)
+		if err != nil {
+			return status.Errorf(codes.Unknown, "could not verify cert: %v", err)
+		}
+		validEK = true
 	}
 
-	opts := gx509.VerifyOptions{
-		Roots: roots,
-	}
-	_, err = leaf.Verify(opts)
-	if err != nil {
-		return status.Errorf(codes.Unknown, "could not verify cert: %v", err)
+	if !validEK {
+		return status.Errorf(codes.Unknown, "could not validate EK")
 	}
 
 	ap := attest.ActivationParameters{
 		TPMVersion: attest.TPMVersion20,
-		EK:         leaf.PublicKey,
+		EK:         ek.Public,
 		AK:         *attestationData.AK,
 	}
 
@@ -187,7 +242,7 @@ func (p *TPMAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 	}
 
 	response := new(common.ChallengeResponse)
-	if err := json.Unmarshal(challengeResp.GetPayload(), response); err != nil {
+	if err := json.Unmarshal(challengeResp.GetChallengeResponse(), response); err != nil {
 		return status.Errorf(codes.Unknown, "unable to unmarshal challenge response: %v", err)
 	}
 
@@ -195,15 +250,10 @@ func (p *TPMAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 		return status.Errorf(codes.Unknown, "incorrect secret from attestor")
 	}
 
-	hashEncoded, err := common.GetPubHash(leaf)
-	if err != nil {
-		return status.Errorf(codes.Unknown, "could not get public key hash: %v", err)
-	}
-
 	return stream.Send(&nodeattestorv1.AttestResponse{
 		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 			AgentAttributes: &nodeattestorv1.AgentAttributes{
-				SpiffeId:       common.AgentID(p.config.TrustDomain, hashEncoded),
+				SpiffeId:       common.AgentID(config.TrustDomain, hashEncoded),
 				SelectorValues: buildSelectors(hashEncoded),
 			},
 		},

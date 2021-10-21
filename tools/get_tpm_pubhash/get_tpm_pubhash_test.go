@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	tpmPubHashExpected = "c1XbxrikL+sgdCw7hKFlmh2/y/QenHiIfLazBlsG/yQ="
+	tpmPubHashExpected = "1b5bbe2e96054f7bc34ebe7ba9a4a9eac5611c6879285ceff6094fa556af485c"
 )
 
 func TestFakeTPM(t *testing.T) {
@@ -35,9 +35,9 @@ func TestFakeTPM(t *testing.T) {
 
 	info, err := tpm.Info()
 	require.NoError(t, err)
-	require.Equal(t, "Microsoft", info.Manufacturer.String())
+	require.Equal(t, info.Manufacturer.String(), "Microsoft")
 
 	tpmPubHash, err := getTpmPubHash(tpm)
 	require.NoError(t, err)
-	require.Equal(t, tpmPubHashExpected, tpmPubHash)
+	require.Equal(t, tpmPubHash, tpmPubHashExpected)
 }
